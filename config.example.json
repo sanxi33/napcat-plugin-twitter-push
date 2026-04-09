@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "commandPrefix": "球鳖",
+  "handle": "",
+  "requestTimeoutMs": 15000,
+  "pollMinutes": 120,
+  "adminQqList": [],
+  "pushStatePath": "data/twitter-push-state.json",
+  "twitterCookieFile": "",
+  "xreachCmd": "xreach.cmd",
+  "authToken": "",
+  "ct0": ""
+}
