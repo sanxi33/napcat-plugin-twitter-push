@@ -52,6 +52,13 @@ xreach.cmd
 3. 在 NapCat 插件管理中导入压缩包
 4. 配置 `handle`、认证信息和管理员 QQ
 
+## 发布产物
+
+发布包包含：
+
+- `index.mjs`
+- `package.json`
+
 ## 已知限制
 
 - 插件本身不内置 Twitter 抓取能力，依赖外部 `xreach`
