@@ -39,7 +39,7 @@
 ```json
 {
   "enabled": true,
-  "commandPrefix": "球鳖",
+  "commandPrefix": "/",
   "handle": "OpenAI",
   "requestTimeoutMs": 15000,
   "pollMinutes": 120,
@@ -49,6 +49,13 @@
   "twitterCookie": ""
 }
 ```
+
+`handle` 就是账号主页 URL 里 `/` 后面的那一段，例如：
+
+- `https://x.com/OpenAI` 的 `handle` 是 `OpenAI`
+- `https://x.com/github` 的 `handle` 是 `github`
+
+填写时不要带 `@`。
 
 通常最关键的是：
 
@@ -60,16 +67,16 @@
 查看最近推文：
 
 ```text
-球鳖 推特
-球鳖 twitter
-球鳖 第1条推特
+/推特
+/twitter
+/第1条推特
 ```
 
 控制群推送：
 
 ```text
-球鳖 开启推特推送
-球鳖 关闭推特推送
+/开启推特推送
+/关闭推特推送
 ```
 
 ## 验证安装
@@ -77,8 +84,8 @@
 建议按以下顺序测试：
 
 1. 配好 `handle`
-2. 在任意聊天里发 `球鳖 推特`
-3. 能返回列表后，再在群里发 `球鳖 开启推特推送`
+2. 在任意聊天里发 `/推特`
+3. 能返回列表后，再在群里发 `/开启推特推送`
 
 ## 快捷安装链接
 

@@ -12,7 +12,7 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 
 const DEFAULT_CONFIG = {
   enabled: true,
-  commandPrefix: '球鳖',
+  commandPrefix: '/',
   handle: '',
   requestTimeoutMs: 15000,
   pollMinutes: 120,
@@ -346,8 +346,8 @@ export const plugin_init = async (ctx) => {
   logger = ctx.logger;
   plugin_config_ui = ctx.NapCatConfig.combine(
     ctx.NapCatConfig.boolean('enabled', '启用插件', true, '总开关'),
-    ctx.NapCatConfig.text('commandPrefix', '命令前缀', '球鳖', ''),
-    ctx.NapCatConfig.text('handle', 'X账号', '', '无需@，例如 OpenAI'),
+    ctx.NapCatConfig.text('commandPrefix', '命令前缀', '/', ''),
+    ctx.NapCatConfig.text('handle', 'X账号', '', '填主页链接里 / 后面的用户名，例如 x.com/OpenAI 里的 OpenAI'),
     ctx.NapCatConfig.number('pollMinutes', '轮询间隔 (分钟)', 120, '1-1440'),
     ctx.NapCatConfig.number('requestTimeoutMs', '请求超时(ms)', 15000, '3000-60000'),
     ctx.NapCatConfig.text('pushStatePath', '状态文件路径', 'data/twitter-push-state.json', ''),
