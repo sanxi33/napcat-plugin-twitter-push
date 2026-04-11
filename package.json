@@ -1,7 +1,7 @@
 {
   "name": "napcat-plugin-twitter-push",
   "plugin": "twitter-push",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "index.mjs",
   "description": "NapCat X/Twitter 查询与推送插件",
