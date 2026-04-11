@@ -1,11 +1,14 @@
 import fs from 'fs';
 import path from 'path';
-import { execFile } from 'child_process';
 
 var EventType = ((EventType2) => {
   EventType2.MESSAGE = 'message';
   return EventType2;
 })(EventType || {});
+
+const TIMELINE_URL = 'https://syndication.twitter.com/srv/timeline-profile/screen-name/';
+const TWEET_URL = 'https://cdn.syndication.twimg.com/tweet-result';
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 const DEFAULT_CONFIG = {
   enabled: true,
@@ -15,8 +18,8 @@ const DEFAULT_CONFIG = {
   pollMinutes: 120,
   adminQqList: [],
   pushStatePath: 'data/twitter-push-state.json',
+  twitterCookie: '',
   twitterCookieFile: '',
-  xreachCmd: 'xreach.cmd',
   authToken: '',
   ct0: ''
 };
@@ -40,12 +43,14 @@ function sanitizeConfig(raw) {
   out.handle = String(out.handle || '').replace(/^@/, '').trim();
   out.requestTimeoutMs = Math.max(3000, Math.min(60000, Number(out.requestTimeoutMs) || 15000));
   out.pollMinutes = Math.max(1, Math.min(1440, Number(out.pollMinutes) || 120));
-  out.adminQqList = Array.isArray(out.adminQqList) ? out.adminQqList.map((item) => String(item)) : [];
+  out.adminQqList = Array.isArray(out.adminQqList)
+    ? out.adminQqList.map((item) => String(item).trim()).filter(Boolean)
+    : String(out.adminQqList || '').split(',').map((item) => item.trim()).filter(Boolean);
   out.pushStatePath = String(out.pushStatePath || 'data/twitter-push-state.json');
-  out.twitterCookieFile = String(out.twitterCookieFile || '');
-  out.xreachCmd = String(out.xreachCmd || 'xreach.cmd');
-  out.authToken = String(out.authToken || '');
-  out.ct0 = String(out.ct0 || '');
+  out.twitterCookie = String(out.twitterCookie || '').trim();
+  out.twitterCookieFile = String(out.twitterCookieFile || '').trim();
+  out.authToken = String(out.authToken || '').trim();
+  out.ct0 = String(out.ct0 || '').trim();
   return out;
 }
 
@@ -84,57 +89,198 @@ function isAdmin(userId) {
   return currentConfig.adminQqList.includes(String(userId || ''));
 }
 
-function parseCookie() {
+function resolveCookie() {
+  if (currentConfig.twitterCookie) return currentConfig.twitterCookie;
   try {
-    if (!currentConfig.twitterCookieFile) return { authToken: '', ct0: '' };
-    const raw = fs.readFileSync(currentConfig.twitterCookieFile, 'utf-8');
-    const auth = (raw.match(/auth_token=([^;\s]+)/) || [])[1] || '';
-    const ct0 = (raw.match(/ct0=([^;\s]+)/) || [])[1] || '';
-    return { authToken: auth, ct0 };
-  } catch {
-    return { authToken: '', ct0: '' };
+    if (currentConfig.twitterCookieFile && fs.existsSync(currentConfig.twitterCookieFile)) {
+      return fs.readFileSync(currentConfig.twitterCookieFile, 'utf-8').trim();
+    }
+  } catch {}
+  if (currentConfig.authToken && currentConfig.ct0) {
+    return `dnt=1; auth_token=${currentConfig.authToken}; ct0=${currentConfig.ct0};`;
+  }
+  return '';
+}
+
+function buildTwitterHeaders(cookie) {
+  return {
+    'User-Agent': BROWSER_UA,
+    Origin: 'https://publish.twitter.com',
+    ...(cookie ? { Cookie: cookie } : {})
+  };
+}
+
+async function fetchText(url, cookie) {
+  const controller = new AbortController();
+  const timerId = setTimeout(() => controller.abort(), currentConfig.requestTimeoutMs + 5000);
+  try {
+    const response = await fetch(url, { headers: buildTwitterHeaders(cookie), signal: controller.signal });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`http_${response.status}${text ? `:${text.slice(0, 120)}` : ''}`);
+    }
+    return text;
+  } finally {
+    clearTimeout(timerId);
   }
 }
 
-function runXreachTweets(handle, count = 8) {
-  return new Promise((resolve, reject) => {
-    const parsed = parseCookie();
-    const authToken = currentConfig.authToken || parsed.authToken;
-    const ct0 = currentConfig.ct0 || parsed.ct0;
-    if (!authToken || !ct0) return reject(new Error('缺少 auth_token/ct0，请配置 twitterCookieFile 或直接填写 authToken/ct0'));
-
-    const args = ['--auth-token', authToken, '--ct0', ct0, 'tweets', handle, '--count', String(Math.max(2, count)), '--json'];
-    const xreachBin = String(currentConfig.xreachCmd || 'xreach.cmd').trim() || 'xreach.cmd';
-    execFile(xreachBin, args, { shell: true, windowsHide: true, timeout: currentConfig.requestTimeoutMs + 5000, maxBuffer: 1024 * 1024 * 8 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message || 'xreach_failed'));
-      try {
-        const data = JSON.parse(stdout);
-        resolve(data?.items || []);
-      } catch (error) {
-        reject(new Error(`xreach_json_parse_failed:${String(error)}`));
-      }
-    });
-  });
+async function fetchJson(url, cookie) {
+  const text = await fetchText(url, cookie);
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`json_parse_failed:${String(error)}|${text.slice(0, 120)}`);
+  }
 }
 
-function runXreachTweet(urlOrId) {
-  return new Promise((resolve, reject) => {
-    const parsed = parseCookie();
-    const authToken = currentConfig.authToken || parsed.authToken;
-    const ct0 = currentConfig.ct0 || parsed.ct0;
-    if (!authToken || !ct0) return reject(new Error('缺少 auth_token/ct0，请配置 twitterCookieFile 或直接填写 authToken/ct0'));
+function extractTimelineData(html) {
+  const match = String(html || '').match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i);
+  if (!match?.[1]) throw new Error('timeline_data_missing');
+  return match[1];
+}
 
-    const args = ['--auth-token', authToken, '--ct0', ct0, 'tweet', String(urlOrId), '--json'];
-    const xreachBin = String(currentConfig.xreachCmd || 'xreach.cmd').trim() || 'xreach.cmd';
-    execFile(xreachBin, args, { shell: true, windowsHide: true, timeout: currentConfig.requestTimeoutMs + 5000, maxBuffer: 1024 * 1024 * 8 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message || 'xreach_tweet_failed'));
-      try {
-        resolve(JSON.parse(stdout));
-      } catch (error) {
-        reject(new Error(`xreach_tweet_json_parse_failed:${String(error)}`));
-      }
-    });
-  });
+async function fetchTimelineEntries(handle) {
+  const cookie = resolveCookie();
+  const html = await fetchText(`${TIMELINE_URL}${encodeURIComponent(handle)}`, cookie);
+  const data = JSON.parse(extractTimelineData(html));
+  return data?.props?.pageProps?.timeline?.entries || [];
+}
+
+function filterTimelineTweets(entries) {
+  return entries
+    .map((entry) => entry?.content?.tweet || null)
+    .filter(Boolean)
+    .filter((tweet) => !tweet?.in_reply_to_name)
+    .filter((tweet) => !String(tweet?.text || '').startsWith('RT @'));
+}
+
+function tokenFromID(id) {
+  return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+}
+
+async function fetchTweetById(id) {
+  const sid = String(id || '').trim();
+  if (!sid) return null;
+  const url = new URL(TWEET_URL);
+  url.searchParams.set('id', sid);
+  url.searchParams.set('token', tokenFromID(sid));
+  url.searchParams.set('dnt', '1');
+  const data = await fetchJson(url.toString(), resolveCookie());
+  return data && Object.keys(data).length ? data : null;
+}
+
+function formatTs(ts) {
+  const date = ts ? new Date(ts) : null;
+  if (!date || Number.isNaN(date.getTime())) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`;
+}
+
+function cqEscape(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/\[/g, '&#91;')
+    .replace(/\]/g, '&#93;')
+    .replace(/,/g, '&#44;');
+}
+
+function extractTweetText(tweet) {
+  return String(tweet?.full_text || tweet?.text || '').trim();
+}
+
+function extractTweetImageUrls(tweet) {
+  const urls = [];
+  const add = (url) => {
+    const s = String(url || '').trim();
+    if (!s || !/^https?:\/\//i.test(s) || urls.includes(s)) return;
+    urls.push(s);
+  };
+
+  for (const media of (tweet?.extended_entities?.media || [])) {
+    add(media?.media_url_https || media?.media_url || media?.url);
+  }
+  for (const media of (tweet?.entities?.media || [])) {
+    add(media?.media_url_https || media?.media_url || media?.url);
+  }
+  for (const media of (tweet?.media || [])) {
+    add(media?.media_url_https || media?.media_url || media?.url);
+  }
+
+  if (!urls.length && tweet?.retweeted_status) {
+    return extractTweetImageUrls(tweet.retweeted_status);
+  }
+
+  return urls.slice(0, 6);
+}
+
+function findQuotedTweetId(tweet) {
+  const currentId = String(tweet?.id_str || tweet?.id || '');
+  const urls = []
+    .concat(tweet?.entities?.urls || [])
+    .concat(tweet?.quoted_status_permalink ? [tweet.quoted_status_permalink] : []);
+
+  for (const item of urls) {
+    const value = String(item?.expanded_url || item?.url || '').trim();
+    const match = value.match(/(?:twitter|x)\.com\/[^/]+\/status\/(\d+)/i);
+    if (match?.[1] && match[1] !== currentId) return match[1];
+  }
+  return '';
+}
+
+async function resolveQuoteSource(tweet) {
+  try {
+    const quoteId = findQuotedTweetId(tweet);
+    if (!quoteId) return null;
+    const source = await fetchTweetById(quoteId);
+    if (!source?.text) return null;
+    const author = source?.user?.screen_name || source?.user?.name || '引用推文';
+    return {
+      text: `//@${author}:${String(source.text || '').trim()}`,
+      images: extractTweetImageUrls(source)
+    };
+  } catch {
+    return null;
+  }
+}
+
+function toWeiboStyleRetweetText(text) {
+  const raw = String(text || '').trim();
+  const match = raw.match(/^RT\s+@([^:]+):\s*([\s\S]+)$/i);
+  if (!match) return { text: raw, hasSource: false };
+  return { text: `//@${match[1]}:${String(match[2] || '').trim()}`, hasSource: true };
+}
+
+async function formatTweet(tweet) {
+  const ts = formatTs(tweet?.created_at || tweet?.createdAt);
+  const rawText = extractTweetText(tweet);
+  let body = rawText;
+  let imageUrls = extractTweetImageUrls(tweet);
+
+  if (tweet?.retweeted_status) {
+    const sourceAuthor = tweet?.retweeted_status?.user?.screen_name || '原作者';
+    const sourceText = extractTweetText(tweet.retweeted_status);
+    const parsed = toWeiboStyleRetweetText(rawText);
+    body = parsed.hasSource ? parsed.text : `//@${sourceAuthor}:${sourceText}`;
+    imageUrls = imageUrls.slice(0, 1);
+  } else {
+    const quoteSource = await resolveQuoteSource(tweet);
+    if (quoteSource?.text) {
+      body = `${rawText}${rawText ? '\n\n' : ''}${quoteSource.text}`;
+      if (!imageUrls.length && quoteSource.images?.length) imageUrls = quoteSource.images;
+      imageUrls = imageUrls.slice(0, 1);
+    }
+  }
+
+  const images = imageUrls.map((url) => `[CQ:image,file=${cqEscape(url)}]`);
+  return images.length ? `${ts ? `${ts}\n\n` : ''}${body}\n${images.join('\n')}` : `${ts ? `${ts}\n\n` : ''}${body}`;
+}
+
+async function getTimelineTweets(handle, limit = 10) {
+  const entries = await fetchTimelineEntries(handle);
+  const tweets = filterTimelineTweets(entries)
+    .sort((a, b) => new Date(b?.created_at || 0).getTime() - new Date(a?.created_at || 0).getTime());
+  return tweets.slice(0, Math.max(1, limit));
 }
 
 async function sendMsg(ctx, event, message) {
@@ -151,126 +297,17 @@ async function sendGroup(groupId, message) {
   await ctxRef.actions.call('send_msg', { message, message_type: 'group', group_id: String(groupId) }, ctxRef.adapterName, ctxRef.pluginManager.config);
 }
 
-function cqEscape(text) {
-  return String(text || '')
-    .replace(/&/g, '&amp;')
-    .replace(/\[/g, '&#91;')
-    .replace(/\]/g, '&#93;')
-    .replace(/,/g, '&#44;');
-}
-
-function extractTweetImageUrls(tweet) {
-  const urls = [];
-  const add = (url) => {
-    const s = String(url || '').trim();
-    if (!s) return;
-    if (!/^https?:\/\//i.test(s)) return;
-    if (urls.includes(s)) return;
-    urls.push(s);
-  };
-
-  if (Array.isArray(tweet?.media)) {
-    for (const media of tweet.media) {
-      if (String(media?.type || '').toLowerCase() === 'photo') add(media?.url);
-    }
-  }
-
-  for (const photo of (tweet?.media?.photos || [])) add(photo?.url || photo?.src || photo?.mediaUrl || photo?.media_url_https);
-  for (const media of (tweet?.extendedEntities?.media || [])) add(media?.media_url_https || media?.media_url || media?.url);
-  for (const media of (tweet?.entities?.media || [])) add(media?.media_url_https || media?.media_url || media?.url);
-  for (const photo of (tweet?.photos || [])) add(photo?.url || photo?.src);
-
-  return urls.slice(0, 6);
-}
-
-function formatTs(ts) {
-  const date = ts ? new Date(ts) : null;
-  if (!date || Number.isNaN(date.getTime())) return '';
-  const p = (n) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`;
-}
-
-function toWeiboStyleRetweetText(text) {
-  const raw = String(text || '').trim();
-  const match = raw.match(/^RT\s+@([^:]+):\s*([\s\S]+)$/i);
-  if (!match) return { text: raw, hasSource: false };
-  return { text: `//@${match[1]}:${String(match[2] || '').trim()}`, hasSource: true };
-}
-
-async function resolveQuoteSource(tweet) {
-  try {
-    const sn = tweet?.user?.screenName || currentConfig.handle;
-    const id = tweet?.id;
-    if (!sn || !id) return null;
-
-    const oembedUrl = `https://publish.twitter.com/oembed?url=${encodeURIComponent(`https://x.com/${sn}/status/${id}`)}`;
-    const response = await fetch(oembedUrl);
-    if (!response.ok) return null;
-    const data = await response.json();
-    const html = String(data?.html || '');
-
-    const match = html.match(/https:\/\/t\.co\/([A-Za-z0-9]+)/);
-    if (!match) return null;
-    const shortUrl = `https://t.co/${match[1]}`;
-
-    const redirected = await fetch(shortUrl, { redirect: 'follow' });
-    const finalUrl = String(redirected?.url || '');
-    const sid = (finalUrl.match(/\/status\/(\d+)/) || [])[1];
-    if (!sid) return null;
-
-    const source = await runXreachTweet(sid);
-    const author = source?.user?.screenName || source?.user?.name || '引用推文';
-    const text = String(source?.text || '').trim();
-    if (!text) return null;
-    return {
-      chain: `//@${author}:${text}`,
-      images: extractTweetImageUrls(source),
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function formatTweet(tweet) {
-  const ts = formatTs(tweet?.createdAt);
-  const raw = String(tweet?.text || '').trim();
-
-  let body = raw;
-  let quoteImages = [];
-  const parsed = toWeiboStyleRetweetText(raw);
-  if (tweet?.isRetweet) {
-    body = parsed.text;
-  } else if (tweet?.isQuote) {
-    const source = await resolveQuoteSource(tweet);
-    if (source?.chain) {
-      body = `${raw}${source.chain}`;
-      quoteImages = source.images || [];
-    } else {
-      body = parsed.hasSource ? parsed.text : `${raw}//@引用推文:（源内容未返回）`;
-    }
-  }
-
-  const text = `${ts ? `${ts}\n\n` : ''}${body}`;
-  let imageUrls = extractTweetImageUrls(tweet);
-  if ((tweet?.isRetweet || tweet?.isQuote) && imageUrls.length === 0 && quoteImages.length > 0) {
-    imageUrls = quoteImages;
-  }
-  if (tweet?.isRetweet || tweet?.isQuote) imageUrls = imageUrls.slice(0, 1);
-  const images = imageUrls.map((url) => `[CQ:image,file=${cqEscape(url)}]`);
-  return images.length ? `${text}\n${images.join('\n')}` : text;
-}
-
 async function handleList(ctx, event) {
   if (!currentConfig.handle) return sendMsg(ctx, event, '请先在配置里设置 handle');
-  const items = await runXreachTweets(currentConfig.handle, 8);
+  const items = await getTimelineTweets(currentConfig.handle, 8);
   if (!items.length) return sendMsg(ctx, event, '暂无推文数据');
-  const top = items.slice(0, 8).map((item, index) => `${index + 1}. ${String(item.text || '').replace(/\n/g, ' ').slice(0, 50)}...`).join('\n');
+  const top = items.slice(0, 8).map((item, index) => `${index + 1}. ${extractTweetText(item).replace(/\n/g, ' ').slice(0, 50)}...`).join('\n');
   return sendMsg(ctx, event, `推特列表(@${currentConfig.handle})：\n${top}\n\n可发：第N条推特`);
 }
 
 async function handleDetail(ctx, event, idx) {
   if (!currentConfig.handle) return sendMsg(ctx, event, '请先在配置里设置 handle');
-  const items = await runXreachTweets(currentConfig.handle, Math.max(8, idx + 2));
+  const items = await getTimelineTweets(currentConfig.handle, Math.max(8, idx + 2));
   const tweet = items[idx - 1];
   if (!tweet) return sendMsg(ctx, event, '序号超出范围');
   return sendMsg(ctx, event, await formatTweet(tweet));
@@ -281,24 +318,22 @@ function startPoller() {
   timer = setInterval(async () => {
     if (!ctxRef || !currentConfig.enabled || !currentConfig.handle) return;
     try {
-      const items = await runXreachTweets(currentConfig.handle, 8);
-      const sorted = items
-        .filter((item) => item?.createdAt)
-        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      const latest = sorted[0] || items[0];
-      if (!latest?.id) return;
+      const items = await getTimelineTweets(currentConfig.handle, 8);
+      const latest = items[0];
+      if (!latest?.id_str) return;
+
       const key = currentConfig.handle;
       const oldId = String(state.lastTweetIdByHandle[key] || '');
-      const latestId = String(latest.id);
+      const latestId = String(latest.id_str);
       if (oldId === latestId) return;
       state.lastTweetIdByHandle[key] = latestId;
       saveState();
       if (!oldId) return;
 
-      const msg = await formatTweet(latest);
+      const message = await formatTweet(latest);
       for (const [gid, enabled] of Object.entries(state.enabledGroups || {})) {
         if (!enabled) continue;
-        await sendGroup(gid, msg);
+        await sendGroup(gid, message);
       }
     } catch (error) {
       logger?.warn('twitter poll failed', error);
@@ -315,19 +350,15 @@ export const plugin_init = async (ctx) => {
     ctx.NapCatConfig.text('handle', 'X账号', '', '无需@，例如 OpenAI'),
     ctx.NapCatConfig.number('pollMinutes', '轮询间隔 (分钟)', 120, '1-1440'),
     ctx.NapCatConfig.number('requestTimeoutMs', '请求超时(ms)', 15000, '3000-60000'),
-    ctx.NapCatConfig.text('twitterCookieFile', 'Twitter Cookie文件', '', '可选，留空则依赖下方 authToken/ct0'),
-    ctx.NapCatConfig.text('xreachCmd', 'xreach命令路径', 'xreach.cmd', '默认假设 xreach.cmd 已在 PATH 中'),
-    ctx.NapCatConfig.text('authToken', 'auth_token(可选)', '', '留空则从 cookie 文件读取'),
-    ctx.NapCatConfig.text('ct0', 'ct0(可选)', '', '留空则从 cookie 文件读取'),
     ctx.NapCatConfig.text('pushStatePath', '状态文件路径', 'data/twitter-push-state.json', ''),
+    ctx.NapCatConfig.text('twitterCookieFile', 'Twitter Cookie文件', '', '可选，某些环境下可提升抓取稳定性'),
+    ctx.NapCatConfig.text('twitterCookie', 'Twitter Cookie字符串', '', '可直接粘贴 Cookie，可选'),
     ctx.NapCatConfig.text('adminQqList', '管理员QQ(逗号分隔)', '', '可控制开启/关闭推送')
   );
 
   try {
     if (ctx.configPath && fs.existsSync(ctx.configPath)) {
-      const cfg = JSON.parse(fs.readFileSync(ctx.configPath, 'utf-8'));
-      if (typeof cfg.adminQqList === 'string') cfg.adminQqList = cfg.adminQqList.split(',').map((item) => item.trim()).filter(Boolean);
-      currentConfig = sanitizeConfig(cfg);
+      currentConfig = sanitizeConfig(JSON.parse(fs.readFileSync(ctx.configPath, 'utf-8')));
     }
   } catch {}
 
@@ -373,18 +404,7 @@ export const plugin_onmessage = async (ctx, event) => {
 };
 
 export const plugin_get_config = async () => currentConfig;
-export const plugin_set_config = async (ctx, cfg) => {
-  if (typeof cfg.adminQqList === 'string') cfg.adminQqList = cfg.adminQqList.split(',').map((item) => item.trim()).filter(Boolean);
-  currentConfig = sanitizeConfig(cfg);
-  try {
-    const dir = path.dirname(ctx.configPath);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(ctx.configPath, JSON.stringify(currentConfig, null, 2), 'utf-8');
-  } catch {}
-  startPoller();
-};
 export const plugin_on_config_change = async (ctx, ui, key, value, cur) => {
-  if (typeof cur.adminQqList === 'string') cur.adminQqList = cur.adminQqList.split(',').map((item) => item.trim()).filter(Boolean);
   currentConfig = sanitizeConfig(cur);
   startPoller();
 };

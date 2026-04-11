@@ -7,7 +7,5 @@
   "adminQqList": [],
   "pushStatePath": "data/twitter-push-state.json",
   "twitterCookieFile": "",
-  "xreachCmd": "xreach.cmd",
-  "authToken": "",
-  "ct0": ""
+  "twitterCookie": ""
 }
